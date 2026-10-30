@@ -2,6 +2,16 @@ from flask import Flask, request, jsonify
 from openai import OpenAI
 import json
 import os
+import time
+
+MODEL = "qwen/qwen3.8-27b"
+HISTORY_LIMIT = 24
+
+
+def trim_history():
+    if len(history) <= HISTORY_LIMIT + 1:
+        return list(history)
+    return [history[0]] + history[-HISTORY_LIMIT:]
 
 
 app = Flask(__name__)
@@ -15,14 +25,36 @@ client = OpenAI(api_key=API_KEY, base_url="https://api.groq.com/openai/v1")
 tools = [{
     "type": "function",
     "function": {
-        "name": "give_item",
-        "description": "Выдать предмет игроку. Используй ТОЛЬКО если игрок выполнил условия для получения ключа или свитка.",
+        "name": "offer_item",
+        "description": "Предложить игроку купить предмет. Используй когда игрок явно просит конкретный товар (эль, хлеб, похлёбку). НЕ используй для ключа/свитка — они выдаются бесплатно по квесту.",
         "parameters": {
             "type": "object",
             "properties": {
                 "item_name": {
                     "type": "string",
-                    "description": "Название предмета: 'cellar_key', 'dragon_scroll', 'ale', 'bread"
+                    "enum": ["bread", "stew", "ale"],
+                    "description": "Название предмета из ассортимента таверны"
+                },
+                "price": {
+                    "type": "integer",
+                    "description": "Цена в медяках (хлеб=2, похлёбка=3, эль=5)"
+                }
+            },
+            "required": ["item_name", "price"]
+        }
+    }
+}, {
+    "type": "function",
+    "function": {
+        "name": "give_quest_item",
+        "description": "Выдать квестовый предмет бесплатно (ключ от подвала, свиток о драконе). Только при выполнении условий квеста.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "item_name": {
+                    "type": "string",
+                    "enum": ["cellar_key", "dragon_scroll", "room"],
+                    "description": "Квестовый предмет"
                 }
             },
             "required": ["item_name"]
@@ -128,84 +160,95 @@ history = [{
 @app.post("/ask")
 def ask():
     user_text = request.get_json().get("text", "")
+    print(f"\n[server] Игрок: {user_text}")
     history.append({"role": "user", "content": user_text})
 
+    t0 = time.time()
     resp = client.chat.completions.create(
-        model="qwen/qwen3.8-27b",
-        messages=history,
+        model=MODEL,
+        messages=trim_history(),
         tools=tools,
         tool_choice="auto",
         temperature=0.8
     )
+    print(f"[server] 1-й вызов: {time.time() - t0:.1f}s")
 
     response_message = resp.choices[0].message
 
     if response_message.tool_calls:
+        tool_call = response_message.tool_calls[0]
+        func_name = tool_call.function.name
+        arguments = json.loads(tool_call.function.arguments)
+
+        print(f"[server] Модель вызвала: {func_name} → {arguments}")
+
+        # Сохраняем assistant message с tool_calls
         history.append({
             "role": "assistant",
             "content": response_message.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in response_message.tool_calls
-            ],
+            "tool_calls": [{"id": tc.id, "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                           for tc in response_message.tool_calls]
         })
 
-        tool_call = response_message.tool_calls[0]
+        # === СЛУЧАЙ 1: Предложение покупки ===
+        if func_name == "offer_item":
+            item_name = arguments.get("item_name", "unknown")
+            price = arguments.get("price", 0)
 
-        if tool_call.function.name == "give_item":
-            arguments = json.loads(tool_call.function.arguments)
-            item_name = arguments.get("item_name", "unknown_item")
+            # Валидация цены на сервере (клиент не доверяет себе!)
+            valid_prices = {"bread": 2, "stew": 3, "ale": 5}
+            if item_name not in valid_prices or price != valid_prices[item_name]:
+                price = valid_prices.get(item_name, 0)
 
-            history.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "name": "give_item",
-                "content": f"Выдан предмет: {item_name}"
+            # Возвращаем ПОДТВЕРЖДЕНИЕ, но НЕ выдаём предмет ещё
+            return jsonify({
+                "answer": response_message.content or f"Держи, с тебя {price} медяков.",
+                "action": "confirm_purchase",
+                "item": item_name,
+                "price": price
             })
 
-            # Просим модель озвучить выдачу предмета игроку
-            final_response = client.chat.completions.create(
-                model="qwen/qwen3.8-27b",
-                messages=history,
-                temperature=0.8
-            )
-            final_answer = final_response.choices[0].message.content or "(Молчание)"
-
-            # ИСПРАВЛЕНИЕ 2: сохраняем финальную реплику Горана в память
+        # === СЛУЧАЙ 2: Квестовый предмет (бесплатно) ===
+        elif func_name == "give_quest_item":
+            item_name = arguments.get("item_name", "unknown")
+            final_answer = (response_message.content or "").strip()
+            if not final_answer:
+                final_answer = f"Держи {item_name.replace('_', ' ')}."
             history.append({"role": "assistant", "content": final_answer})
-
             return jsonify({
                 "answer": final_answer,
                 "action": "give_item",
-                "item": item_name
+                "item": item_name,
+                "price": 0
             })
 
         else:
+            # Неизвестная функция — фолбэк
             history.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
-                "name": tool_call.function.name,
-                "content": "Ошибка: такой функции не существует."
+                "name": func_name,
+                "content": "Ошибка: неизвестная функция."
             })
-            final_response = client.chat.completions.create(
-                model="qwen/qwen3.8-27b",
-                messages=history,
-                temperature=0.8
-            )
-            final_answer = final_response.choices[0].message.content or "(Молчание)"
-            history.append({"role": "assistant", "content": final_answer})
-            return jsonify({"answer": final_answer})
+            return jsonify({"answer": "...Что-то пошло не так.", "action": "", "item": "", "price": 0})
 
+    # Обычный текстовый ответ
     answer = response_message.content or "(Молчание)"
     history.append({"role": "assistant", "content": answer})
-    return jsonify({"answer": answer})
+    print(f"[server] итог: {time.time() - t0:.1f}s")
+    return jsonify({"answer": answer, "action": "", "item": "", "price": 0})
+
+
+@app.post("/confirm_purchase")
+def confirm_purchase():
+    """Сервер фиксирует завершённую покупку (для античита/статистики)."""
+    data = request.get_json()
+    item = data.get("item", "")
+    price = data.get("price", 0)
+    print(f"[server] ✅ Покупка подтверждена: {item} за {price} мед.")
+    # Здесь можно вести лог сделок, репутацию игрока и т.д.
+    return jsonify({"status": "ok"})
 
 
 if __name__ == "__main__":

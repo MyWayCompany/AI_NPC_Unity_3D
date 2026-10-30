@@ -15,11 +15,26 @@ public class NPCDialogue : MonoBehaviour, IInteractable
         ConversationController.Instance.StartConversation(this);
     }
 
+    /// <summary>
+    /// Передаём реплику игрока в AI-сервис (который идёт на Flask-сервер).
+    /// Колбэк получит текстовый ответ Горана. Предметы обрабатываются отдельно
+    /// через событие AIService.OnItemGiven (подписывается InventoryManager).
+    /// </summary>
     public void AskAI(string playerMessage, System.Action<string> onResponse)
     {
-        // TODO: сюда позже подключим настоящий AI из DialogueManager
-        // Пока — заглушка для теста системы
-        string aiResponse = $"Привет! Я {npcName}. Как я могу помочь тебе?";
-        onResponse?.Invoke(aiResponse);
+        AIService.Instance.AskGoran(playerMessage, r => onResponse?.Invoke(r.answer));
+    }
+
+    /// <summary>Полный ответ от AI (текст + действие + предмет + цена).</summary>
+    public void AskAIFull(string playerMessage, System.Action<AIResponse> onResponse)
+    {
+        if (AIService.Instance == null)
+        {
+            Debug.LogError("[NPCDialogue] AIService.Instance is NULL!");
+            onResponse?.Invoke(new AIResponse { answer = "...Связь потеряна...", action = "", item = "", price = 0 });
+            return;
+        }
+
+        AIService.Instance.AskGoran(playerMessage, onResponse);
     }
 }

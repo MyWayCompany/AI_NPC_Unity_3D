@@ -1,152 +1,145 @@
-﻿using System;
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
 
 public class InventoryManager : MonoBehaviour
 {
     public static InventoryManager Instance { get; private set; }
 
-    public int coins = 0;
-    public List<ItemSlot> inventory = new List<ItemSlot>();
-    public int maxSlots = 20;
+    [Header("Панель инвентаря")]
+    public GameObject inventoryPanel;  // перетащи InventoryPanel
+    public bool startOpen = false;
 
-    [Header("UI")]
-    public GameObject inventoryPanel;
-    public TMPro.TextMeshProUGUI coinText;
-    public Transform slotsParent;
-    public GameObject slotPrefab;
+    [Header("Слоты")]
+    public Transform slotsParent;      // перетащи SlotsParent
+    public GameObject slotPrefab;      // перетащи SlotPrefab из Project
+    public int slotCount = 20;
 
-    private bool isOpen = false;
+    private readonly List<InventorySlotUI> slots = new List<InventorySlotUI>();
+    private readonly Dictionary<string, int> items = new Dictionary<string, int>();
+    private bool isOpen;
+
+    public event System.Action<string, int> OnItemAdded;
+    public event System.Action<string, int> OnItemRemoved;
 
     private void Awake()
     {
-        if (Instance == null)
-        {
-            Instance = this;
-            DontDestroyOnLoad(gameObject);
-        }
-        else
-        {
-            Destroy(gameObject);
-        }
+        if (Instance != null && Instance != this) { Destroy(gameObject); return; }
+        Instance = this;
+
+        if (inventoryPanel != null) inventoryPanel.SetActive(startOpen);
+        isOpen = startOpen;
+
+        BuildSlots();
+        RefreshAllSlots();
     }
 
     private void Start()
     {
-        UpdateCoinUI();
-        CreateInventorySlots();
+        if (AIService.Instance != null)
+            AIService.Instance.OnItemGiven += HandleItemGiven;
+    }
+
+    private void OnDestroy()
+    {
+        if (AIService.Instance != null)
+            AIService.Instance.OnItemGiven -= HandleItemGiven;
+    }
+
+    /// <summary>Собирает слоты из сцены, а если их нет — создаёт из префаба.</summary>
+    private void BuildSlots()
+    {
+        if (slotsParent == null)
+        {
+            Debug.LogError("[Inventory] slotsParent не назначен в Inspector!");
+            return;
+        }
+
+        slots.Clear();
+        slots.AddRange(slotsParent.GetComponentsInChildren<InventorySlotUI>(true));
+
+        if (slots.Count == 0 && slotPrefab != null)
+        {
+            for (int i = 0; i < slotCount; i++)
+            {
+                GameObject go = Instantiate(slotPrefab, slotsParent);
+                go.name = $"Slot_{i}";
+                slots.Add(go.GetComponent<InventorySlotUI>());
+            }
+            Debug.Log($"[Inventory] Создано слотов: {slotCount}");
+        }
+
+        if (slots.Count == 0)
+            Debug.LogError("[Inventory] Слоты не найдены и не созданы! Проверь slotPrefab и компонент InventorySlotUI на нём.");
     }
 
     private void Update()
     {
-        var keyboard = Keyboard.current;
-        if (keyboard != null && keyboard[Key.I].wasPressedThisFrame)
-        {
-            ToggleInventory();
-        }
+        var kb = Keyboard.current;
+        if (kb == null) return;
+
+        // Не открываем инвентарь, пока игрок печатает в поле ввода диалога
+        if (EventSystem.current != null && EventSystem.current.currentSelectedGameObject != null)
+            return;
+
+        if (kb[Key.I].wasPressedThisFrame)
+            Toggle();
     }
 
-    private void ToggleInventory()
+    public void Toggle()
     {
         isOpen = !isOpen;
-        inventoryPanel.SetActive(isOpen);
+        if (inventoryPanel != null) inventoryPanel.SetActive(isOpen);
+    }
 
-        if (isOpen)
+    private void HandleItemGiven(string itemId) => AddItem(itemId, 1);
+
+    public bool AddItem(string itemId, int count = 1)
+    {
+        if (items.ContainsKey(itemId))
         {
-            Time.timeScale = 0f;
+            items[itemId] += count;
         }
         else
         {
-            Time.timeScale = 1f;
-        }
-    }
-
-    private void CreateInventorySlots()
-    {
-        for (int i = 0; i < maxSlots; i++)
-        {
-            GameObject slot = Instantiate(slotPrefab, slotsParent);
-            inventory.Add(new ItemSlot());
-        }
-    }
-
-    private void UpdateCoinUI()
-    {
-        if (coinText != null)
-        {
-            coinText.text = $"Монеты: {coins}";
-        }
-    }
-
-    public void AddCoin(int amount)
-    {
-        coins += amount;
-        UpdateCoinUI();
-        ShowNotification($"Получено {amount} ??", Color.yellow);
-    }
-
-    public void SpendCoin(int amount)
-    {
-        if (coins >= amount)
-        {
-            coins -= amount;
-            UpdateCoinUI();          
-        }        
-    }
-
-    public bool AddItem(Item item, int quantity = 1)
-    {
-        for(int i = 0; i < inventory.Count; i++)
-        {
-            if(inventory[i].item == item && inventory[i].quantity < item.maxStack)
+            if (items.Count >= slots.Count)
             {
-                int canAdd = Mathf.Min(quantity, item.maxStack - inventory[i].quantity);
-                inventory[i].quantity += canAdd;
-                quantity -= canAdd;
-
-                if (quantity < 0)
-                {
-                    ShowNotification($"Получено: {item.itemName} x{canAdd}", Color.white);
-                    return true;
-                }
+                Debug.LogWarning("[Inventory] Нет свободных слотов!");
+                return false;
             }
+            items[itemId] = count;
         }
 
-        for (int i = 0; i < inventory.Count;i++)
-        {
-            if (inventory[i].item == null)
-            {
-                inventory[i].item = item;
-                inventory[i].quantity = Mathf.Min(quantity, item.maxStack);
-                quantity -= inventory[i].quantity;
-
-                ShowNotification($"Получено: {item.itemName} x{inventory[i].quantity}", Color.white);
-
-                if (quantity <= 0)
-                {
-                    return AddItem(item, quantity);
-                }
-
-                return true;
-            }
-        }
-
-        ShowNotification("Инвентарь полон!", Color.red);
-        return false;
+        RefreshAllSlots();
+        OnItemAdded?.Invoke(itemId, count);
+        return true;
     }
 
-    private void ShowNotification(string message, Color color)
+    public bool HasItem(string itemId) => GetCount(itemId) > 0;
+    public int GetCount(string itemId) => items.TryGetValue(itemId, out var c) ? c : 0;
+
+    private void RefreshAllSlots()
     {
-        NotificationManager.Instance.Show(message, color);
+        int i = 0;
+        foreach (var kv in items)
+        {
+            if (i >= slots.Count) break;
+            var info = ItemDatabase.Get(kv.Key);
+            slots[i].Set(kv.Value, info.iconColor);
+            i++;
+        }
+        for (; i < slots.Count; i++)
+            slots[i].SetEmpty();
     }
-}
+    public bool RemoveItem(string itemId, int count = 1)
+    {
+        if (!items.ContainsKey(itemId) || items[itemId] < count) return false;
+        items[itemId] -= count;
+        if (items[itemId] <= 0) items.Remove(itemId);
+        RefreshAllSlots();
+        OnItemRemoved?.Invoke(itemId, count);
+        return true;
+    }
 
-
-
-[System.Serializable]
-public class ItemSlot
-{
-    public Item item;
-    public int quantity = 0;    
 }
